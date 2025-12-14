@@ -1,3 +1,4 @@
+
 'use client'
 
 import { useState } from 'react'
@@ -161,35 +162,48 @@ export default function Workout({ userId, onSave }: WorkoutProps) {
             <div>RPE</div>
           </div>
 
-          {ex.sets.map((set, setIndex) => (
-            <div key={setIndex} className="grid grid-cols-4 gap-2 mb-2">
-              <div className="flex items-center justify-center text-gray-500">
-                {setIndex + 1}
+          {ex.sets.map((set, setIndex) => {
+            const weight = parseFloat(set.weight) || 0
+            const reps = parseInt(set.reps) || 0
+            const e1rm = weight && reps ? calculateE1RM(weight, reps) : 0
+            
+            return (
+              <div key={setIndex} className="mb-3">
+                <div className="grid grid-cols-4 gap-2">
+                  <div className="flex items-center justify-center text-gray-500">
+                    {setIndex + 1}
+                  </div>
+                  <input
+                    type="number"
+                    value={set.weight}
+                    onChange={(e) => updateSet(exIndex, setIndex, 'weight', e.target.value)}
+                    placeholder="185"
+                    className="text-sm"
+                  />
+                  <input
+                    type="number"
+                    value={set.reps}
+                    onChange={(e) => updateSet(exIndex, setIndex, 'reps', e.target.value)}
+                    placeholder="8"
+                    className="text-sm"
+                  />
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={set.rpe}
+                    onChange={(e) => updateSet(exIndex, setIndex, 'rpe', e.target.value)}
+                    placeholder="8.5"
+                    className="text-sm"
+                  />
+                </div>
+                {e1rm > 0 && (
+                  <div className="text-right text-xs mt-1" style={{ color: '#FF6B35' }}>
+                    → {e1rm} e1RM
+                  </div>
+                )}
               </div>
-              <input
-                type="number"
-                value={set.weight}
-                onChange={(e) => updateSet(exIndex, setIndex, 'weight', e.target.value)}
-                placeholder="185"
-                className="text-sm"
-              />
-              <input
-                type="number"
-                value={set.reps}
-                onChange={(e) => updateSet(exIndex, setIndex, 'reps', e.target.value)}
-                placeholder="8"
-                className="text-sm"
-              />
-              <input
-                type="number"
-                step="0.5"
-                value={set.rpe}
-                onChange={(e) => updateSet(exIndex, setIndex, 'rpe', e.target.value)}
-                placeholder="8.5"
-                className="text-sm"
-              />
-            </div>
-          ))}
+            )
+          })}
         </div>
       ))}
 
