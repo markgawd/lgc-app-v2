@@ -68,7 +68,7 @@ export default function Dashboard({ userId, profile }: DashboardProps) {
         }
         
         // Calculate 7-day streak
-        const last7Days = []
+        const last7Days: string[] = []
         for (let i = 0; i < 7; i++) {
           const d = new Date()
           d.setDate(d.getDate() - i)
