@@ -8,10 +8,21 @@ interface ImportProps {
   onImport: () => void
 }
 
+interface ConflictInfo {
+  date: string
+  exercise: string
+  existingE1RM: number
+  newE1RM: number
+  action: 'keep' | 'replace'
+}
+
 export default function Import({ userId, onImport }: ImportProps) {
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState(0)
   const [log, setLog] = useState<string[]>([])
+  const [conflicts, setConflicts] = useState<ConflictInfo[]>([])
+  const [showConflictModal, setShowConflictModal] = useState(false)
+  const [pendingImport, setPendingImport] = useState<{ workouts: any[], measurements: any[] } | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const addLog = (msg: string) => {
@@ -45,6 +56,7 @@ export default function Import({ userId, onImport }: ImportProps) {
     setImporting(true)
     setProgress(0)
     setLog([])
+    setConflicts([])
     addLog(`📂 Reading ${file.name}...`)
 
     try {
@@ -54,26 +66,26 @@ export default function Import({ userId, onImport }: ImportProps) {
 
       addLog(`Found ${lines.length - 1} rows`)
 
-      // Detect file type
+      // Detect file type and process
       if (headers.includes('Exercise Name')) {
-        await importWorkouts(lines, headers)
+        await processWorkouts(lines, headers)
       } else if (headers.includes('Measurement Type')) {
-        await importMeasurements(lines, headers)
+        await processMeasurements(lines, headers)
       } else {
         addLog('⚠️ Unknown file format')
+        setImporting(false)
       }
 
-      onImport()
     } catch (err) {
       console.error('Import error:', err)
       addLog(`❌ Error: ${err}`)
-    } finally {
       setImporting(false)
-      if (fileInputRef.current) fileInputRef.current.value = ''
     }
+    
+    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  const importWorkouts = async (lines: string[], headers: string[]) => {
+  const processWorkouts = async (lines: string[], headers: string[]) => {
     addLog('🏋️ Detected workout file')
 
     const dateIdx = headers.indexOf('Date')
@@ -81,11 +93,9 @@ export default function Import({ userId, onImport }: ImportProps) {
     const setOrderIdx = headers.indexOf('Set Order')
     const weightIdx = headers.indexOf('Weight')
     const repsIdx = headers.indexOf('Reps')
-    const rpeIdx = headers.indexOf('RPE')
 
     // Group by date + exercise
     const workoutMap: Map<string, any> = new Map()
-    let processed = 0
 
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCSVLine(lines[i])
@@ -132,18 +142,104 @@ export default function Import({ userId, onImport }: ImportProps) {
         entry.bestReps = reps
       }
 
-      processed++
-      setProgress(Math.round((i / lines.length) * 50))
+      setProgress(Math.round((i / lines.length) * 30))
     }
 
-    addLog(`📊 Found ${workoutMap.size} unique workout entries`)
+    addLog(`📊 Found ${workoutMap.size} workout entries in CSV`)
 
-    // Save to database in batches
-    const entries = Array.from(workoutMap.values())
+    // Check for conflicts with existing data
+    const entries = Array.from(workoutMap.values()).map(entry => ({
+      ...entry,
+      e1rm: calculateE1RM(entry.bestWeight, entry.bestReps)
+    }))
+
+    // Fetch existing workouts for this user
+    const { data: existingWorkouts } = await supabase
+      .from('workout_sets')
+      .select('date, exercise, e1rm')
+      .eq('user_id', userId)
+
+    setProgress(50)
+
+    // Find conflicts
+    const conflictList: ConflictInfo[] = []
+    const existingMap = new Map<string, number>()
+    
+    if (existingWorkouts) {
+      for (const w of existingWorkouts) {
+        existingMap.set(`${w.date}|${w.exercise}`, w.e1rm)
+      }
+    }
+
+    for (const entry of entries) {
+      const key = `${entry.date}|${entry.exercise}`
+      const existingE1RM = existingMap.get(key)
+      
+      if (existingE1RM !== undefined) {
+        conflictList.push({
+          date: entry.date,
+          exercise: entry.exercise,
+          existingE1RM,
+          newE1RM: entry.e1rm,
+          action: entry.e1rm > existingE1RM ? 'replace' : 'keep'
+        })
+      }
+    }
+
+    setProgress(60)
+
+    if (conflictList.length > 0) {
+      // Show conflict summary
+      const keepCount = conflictList.filter(c => c.action === 'keep').length
+      const replaceCount = conflictList.filter(c => c.action === 'replace').length
+      
+      addLog(`⚠️ Found ${conflictList.length} overlapping entries`)
+      addLog(`   → ${keepCount} existing records are better (will keep)`)
+      addLog(`   → ${replaceCount} CSV records are better (will update)`)
+      
+      setConflicts(conflictList)
+      setPendingImport({ workouts: entries, measurements: [] })
+      setShowConflictModal(true)
+      setImporting(false)
+    } else {
+      // No conflicts, import directly
+      await executeWorkoutImport(entries)
+    }
+  }
+
+  const executeWorkoutImport = async (entries: any[]) => {
+    addLog(`💾 Saving workouts...`)
+    
+    // Fetch existing data to apply "keep best" logic
+    const { data: existingWorkouts } = await supabase
+      .from('workout_sets')
+      .select('date, exercise, e1rm')
+      .eq('user_id', userId)
+
+    const existingMap = new Map<string, number>()
+    if (existingWorkouts) {
+      for (const w of existingWorkouts) {
+        existingMap.set(`${w.date}|${w.exercise}`, w.e1rm)
+      }
+    }
+
+    // Filter to only import entries that are NEW or BETTER
+    const toImport = entries.filter(entry => {
+      const key = `${entry.date}|${entry.exercise}`
+      const existingE1RM = existingMap.get(key)
+      
+      if (existingE1RM === undefined) return true // New entry
+      return entry.e1rm > existingE1RM // Better than existing
+    })
+
+    const skipped = entries.length - toImport.length
+    if (skipped > 0) {
+      addLog(`⏭️ Skipping ${skipped} entries (existing records are better)`)
+    }
+
     let saved = 0
-
-    for (let i = 0; i < entries.length; i += 50) {
-      const batch = entries.slice(i, i + 50).map(entry => ({
+    for (let i = 0; i < toImport.length; i += 50) {
+      const batch = toImport.slice(i, i + 50).map(entry => ({
         user_id: userId,
         date: entry.date,
         exercise: entry.exercise,
@@ -151,7 +247,7 @@ export default function Import({ userId, onImport }: ImportProps) {
         sets: entry.sets,
         best_weight: entry.bestWeight,
         best_reps: entry.bestReps,
-        e1rm: calculateE1RM(entry.bestWeight, entry.bestReps)
+        e1rm: entry.e1rm
       }))
 
       const { error } = await supabase
@@ -164,13 +260,16 @@ export default function Import({ userId, onImport }: ImportProps) {
         saved += batch.length
       }
 
-      setProgress(50 + Math.round((i / entries.length) * 50))
+      setProgress(70 + Math.round((i / toImport.length) * 30))
     }
 
     addLog(`✅ Imported ${saved} workout entries`)
+    setImporting(false)
+    setPendingImport(null)
+    onImport()
   }
 
-  const importMeasurements = async (lines: string[], headers: string[]) => {
+  const processMeasurements = async (lines: string[], headers: string[]) => {
     addLog('📏 Detected measurement file')
 
     const dateIdx = headers.indexOf('Date')
@@ -203,17 +302,51 @@ export default function Import({ userId, onImport }: ImportProps) {
 
     addLog(`📊 Found ${measureMap.size} measurement days`)
 
-    // Save to database
+    // For measurements, we merge rather than replace
+    // This preserves any additional fields (sleep, notes) that might exist
     const entries = Array.from(measureMap.values())
     let saved = 0
+    let merged = 0
+
+    // Get existing check-ins
+    const { data: existingCheckins } = await supabase
+      .from('daily_checkins')
+      .select('*')
+      .eq('user_id', userId)
+
+    const existingMap = new Map<string, any>()
+    if (existingCheckins) {
+      for (const c of existingCheckins) {
+        existingMap.set(c.date, c)
+      }
+    }
 
     for (let i = 0; i < entries.length; i += 50) {
-      const batch = entries.slice(i, i + 50).map(entry => ({
-        user_id: userId,
-        date: entry.date,
-        weight: entry.weight || null,
-        waist: entry.waist || null
-      }))
+      const batch = entries.slice(i, i + 50).map(entry => {
+        const existing = existingMap.get(entry.date)
+        
+        if (existing) {
+          merged++
+          // Merge: keep existing fields, only update weight/waist if CSV has them
+          return {
+            user_id: userId,
+            date: entry.date,
+            weight: entry.weight || existing.weight,
+            waist: entry.waist || existing.waist,
+            sleep_quality: existing.sleep_quality,
+            notes: existing.notes,
+            neck: existing.neck,
+            hips: existing.hips
+          }
+        } else {
+          return {
+            user_id: userId,
+            date: entry.date,
+            weight: entry.weight || null,
+            waist: entry.waist || null
+          }
+        }
+      })
 
       const { error } = await supabase
         .from('daily_checkins')
@@ -224,7 +357,27 @@ export default function Import({ userId, onImport }: ImportProps) {
       setProgress(50 + Math.round((i / entries.length) * 50))
     }
 
+    if (merged > 0) {
+      addLog(`🔀 Merged ${merged} entries with existing data`)
+    }
     addLog(`✅ Imported ${saved} check-in entries`)
+    setImporting(false)
+    onImport()
+  }
+
+  const handleConfirmImport = () => {
+    setShowConflictModal(false)
+    setImporting(true)
+    if (pendingImport?.workouts.length) {
+      executeWorkoutImport(pendingImport.workouts)
+    }
+  }
+
+  const handleCancelImport = () => {
+    setShowConflictModal(false)
+    setPendingImport(null)
+    setConflicts([])
+    addLog('❌ Import cancelled')
   }
 
   return (
@@ -234,11 +387,11 @@ export default function Import({ userId, onImport }: ImportProps) {
       {/* Drop zone */}
       <div
         className="card p-8 border-2 border-dashed border-gray-600 text-center cursor-pointer hover:border-[#FF6B35] transition-colors"
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => !importing && fileInputRef.current?.click()}
       >
         <div className="text-4xl mb-4">📤</div>
         <div className="text-lg font-medium mb-2">
-          {importing ? 'Importing...' : 'Click to upload CSV'}
+          {importing ? 'Processing...' : 'Click to upload CSV'}
         </div>
         <div className="text-sm text-gray-400">
           Supports Strong app exports (workouts, weight, waist)
@@ -249,14 +402,25 @@ export default function Import({ userId, onImport }: ImportProps) {
           accept=".csv"
           onChange={handleFile}
           className="hidden"
+          disabled={importing}
         />
+      </div>
+
+      {/* Smart Import Info */}
+      <div className="card p-4 mt-4 bg-[#1a2a1a] border border-green-900">
+        <div className="text-sm font-medium text-green-400 mb-2">🛡️ Smart Import Protection</div>
+        <ul className="text-xs text-gray-400 space-y-1">
+          <li>• <strong>Keeps your best lifts</strong> - won't overwrite with weaker data</li>
+          <li>• <strong>Merges check-ins</strong> - preserves notes and sleep data</li>
+          <li>• <strong>Shows conflicts</strong> - you'll see what will change</li>
+        </ul>
       </div>
 
       {/* Progress */}
       {importing && (
         <div className="card p-4 mt-4">
           <div className="flex justify-between text-sm mb-2">
-            <span>Importing...</span>
+            <span>Processing...</span>
             <span>{progress}%</span>
           </div>
           <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
@@ -277,6 +441,49 @@ export default function Import({ userId, onImport }: ImportProps) {
               {msg}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Conflict Modal */}
+      {showConflictModal && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+          <div className="card p-6 max-w-md w-full max-h-[80vh] overflow-y-auto">
+            <h3 className="text-lg font-bold mb-2">⚠️ Overlapping Data Found</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Some entries in your CSV overlap with existing data. 
+              We'll only update records where the CSV has a <strong>better e1RM</strong>.
+            </p>
+
+            <div className="space-y-2 mb-4 max-h-48 overflow-y-auto">
+              {conflicts.slice(0, 10).map((c, i) => (
+                <div key={i} className={`p-2 rounded text-xs ${c.action === 'keep' ? 'bg-gray-800' : 'bg-green-900/30'}`}>
+                  <div className="flex justify-between">
+                    <span>{c.date} - {c.exercise}</span>
+                    <span className={c.action === 'keep' ? 'text-gray-400' : 'text-green-400'}>
+                      {c.action === 'keep' ? 'Keep existing' : 'Update →'}
+                    </span>
+                  </div>
+                  <div className="text-gray-500">
+                    Existing: {c.existingE1RM} e1RM → CSV: {c.newE1RM} e1RM
+                  </div>
+                </div>
+              ))}
+              {conflicts.length > 10 && (
+                <div className="text-xs text-gray-500 text-center">
+                  ...and {conflicts.length - 10} more
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={handleCancelImport} className="btn btn-secondary flex-1">
+                Cancel
+              </button>
+              <button onClick={handleConfirmImport} className="btn btn-primary flex-1">
+                Continue Import
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
